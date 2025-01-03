@@ -12,9 +12,11 @@ from modules.ui import plaintext_to_html
 from modules.infotext_utils import create_override_settings_dict
 import modules.images as images_util
 
-def url_requests(url, data):
+def url_requests(url, data, return_base64str=False):
     resp = requests.post(url, data=json.dumps(data))
     img_strs = json.loads(resp.text)["images"]
+    if return_base64str:
+        return img_strs
 
     images_list = []
     for img_str in img_strs:
