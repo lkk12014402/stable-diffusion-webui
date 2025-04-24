@@ -100,7 +100,7 @@ def initialize_rest(*, reload_script_modules=False):
         return
 
     from modules import sd_models
-    sd_models.list_models()
+    # sd_models.list_models()
     startup_timer.record("list SD models")
 
     from modules import localization

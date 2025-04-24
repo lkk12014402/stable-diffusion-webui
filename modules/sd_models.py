@@ -681,6 +681,8 @@ class SdModelData:
         self.lock = threading.Lock()
 
     def get_sd_model(self):
+        # don't load local model
+        return None
         if self.was_loaded_at_least_once:
             return self.sd_model
 

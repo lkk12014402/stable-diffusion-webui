@@ -33,6 +33,8 @@ import piexif.helper
 from contextlib import closing
 from modules.progress import create_task_id, add_task_to_queue, start_task, finish_task, current_task
 
+from modules.opea_services import url_requests
+
 def script_name_to_index(name, scripts):
     try:
         return [script.title().lower() for script in scripts].index(name.lower())
@@ -208,8 +210,8 @@ class Api:
         self.app = app
         self.queue_lock = queue_lock
         api_middleware(self.app)
-        self.add_api_route("/sdapi/v1/txt2img", self.text2imgapi, methods=["POST"], response_model=models.TextToImageResponse)
-        self.add_api_route("/sdapi/v1/img2img", self.img2imgapi, methods=["POST"], response_model=models.ImageToImageResponse)
+        self.add_api_route("/sdapi/v1/txt2img", self.opea_text2imgapi, methods=["POST"], response_model=models.TextToImageResponse)
+        self.add_api_route("/sdapi/v1/img2img", self.opea_img2imgapi, methods=["POST"], response_model=models.ImageToImageResponse)
         self.add_api_route("/sdapi/v1/extra-single-image", self.extras_single_image_api, methods=["POST"], response_model=models.ExtrasSingleImageResponse)
         self.add_api_route("/sdapi/v1/extra-batch-images", self.extras_batch_images_api, methods=["POST"], response_model=models.ExtrasBatchImagesResponse)
         self.add_api_route("/sdapi/v1/png-info", self.pnginfoapi, methods=["POST"], response_model=models.PNGInfoResponse)
@@ -429,6 +431,73 @@ class Api:
 
         return params
 
+    def opea_text2imgapi(self, txt2imgreq: models.StableDiffusionTxt2ImgProcessingAPI):
+        task_id = txt2imgreq.force_task_id or create_task_id("txt2img")
+
+        script_runner = scripts.scripts_txt2img
+
+        infotext_script_args = {}
+        self.apply_infotext(txt2imgreq, "txt2img", script_runner=script_runner, mentioned_script_args=infotext_script_args)
+
+        selectable_scripts, selectable_script_idx = self.get_selectable_script(txt2imgreq.script_name, script_runner)
+        sampler, scheduler = sd_samplers.get_sampler_and_scheduler(txt2imgreq.sampler_name or txt2imgreq.sampler_index, txt2imgreq.scheduler)
+
+        populate = txt2imgreq.copy(update={  # Override __init__ params
+            "sampler_name": validate_sampler_name(sampler),
+            "do_not_save_samples": not txt2imgreq.save_images,
+            "do_not_save_grid": not txt2imgreq.save_images,
+        })
+        if populate.sampler_name:
+            populate.sampler_index = None  # prevent a warning later on
+
+        if not populate.scheduler and scheduler != "Automatic":
+            populate.scheduler = scheduler
+
+        args = vars(populate)
+        args.pop('script_name', None)
+        args.pop('script_args', None) # will refeed them to the pipeline directly after initializing them
+        args.pop('alwayson_scripts', None)
+        args.pop('infotext', None)
+
+        script_args = self.init_script_args(txt2imgreq, self.default_script_arg_txt2img, selectable_scripts, selectable_script_idx, script_runner, input_script_args=infotext_script_args)
+
+        send_images = args.pop('send_images', True)
+        args.pop('save_images', None)
+
+        add_task_to_queue(task_id)
+
+        with self.queue_lock:
+            with closing(StableDiffusionProcessingTxt2Img(sd_model=shared.sd_model, **args)) as p:
+                p.is_api = True
+                p.scripts = script_runner
+                p.outpath_grids = opts.outdir_txt2img_grids
+                p.outpath_samples = opts.outdir_txt2img_samples
+
+                try:
+                    shared.state.begin(job="scripts_txt2img")
+                    start_task(task_id)
+                    data = {
+                        "prompt": p.prompt,
+                        "negative_prompt": p.negative_prompt,
+                        "num_images_per_prompt": p.batch_size,
+                        "num_inference_steps": p.steps,
+                        "guidance_scale": p.cfg_scale,
+                        "seed": p.seed,
+                        "height": p.height,
+                        "width": p.width,
+                        "strength": p.denoising_strength}
+
+                    images = url_requests(shared.cmd_opts.opea_txt2img_url, data, return_base64str=True)
+
+                    finish_task(task_id)
+                finally:
+                    shared.state.end()
+                    shared.total_tqdm.clear()
+
+        b64images = images if send_images else []
+
+        return models.TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info="")
+
     def text2imgapi(self, txt2imgreq: models.StableDiffusionTxt2ImgProcessingAPI):
         task_id = txt2imgreq.force_task_id or create_task_id("txt2img")
 
@@ -488,6 +557,89 @@ class Api:
         b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
 
         return models.TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
+
+    def opea_img2imgapi(self, img2imgreq: models.StableDiffusionImg2ImgProcessingAPI):
+        task_id = img2imgreq.force_task_id or create_task_id("img2img")
+
+        init_images = img2imgreq.init_images
+        if init_images is None:
+            raise HTTPException(status_code=404, detail="Init image not found")
+
+        mask = img2imgreq.mask
+        if mask:
+            mask = decode_base64_to_image(mask)
+
+        script_runner = scripts.scripts_img2img
+
+        infotext_script_args = {}
+        self.apply_infotext(img2imgreq, "img2img", script_runner=script_runner, mentioned_script_args=infotext_script_args)
+
+        selectable_scripts, selectable_script_idx = self.get_selectable_script(img2imgreq.script_name, script_runner)
+        sampler, scheduler = sd_samplers.get_sampler_and_scheduler(img2imgreq.sampler_name or img2imgreq.sampler_index, img2imgreq.scheduler)
+
+        populate = img2imgreq.copy(update={  # Override __init__ params
+            "sampler_name": validate_sampler_name(sampler),
+            "do_not_save_samples": not img2imgreq.save_images,
+            "do_not_save_grid": not img2imgreq.save_images,
+            "mask": mask,
+        })
+        if populate.sampler_name:
+            populate.sampler_index = None  # prevent a warning later on
+
+        if not populate.scheduler and scheduler != "Automatic":
+            populate.scheduler = scheduler
+
+        args = vars(populate)
+        args.pop('include_init_images', None)  # this is meant to be done by "exclude": True in model, but it's for a reason that I cannot determine.
+        args.pop('script_name', None)
+        args.pop('script_args', None)  # will refeed them to the pipeline directly after initializing them
+        args.pop('alwayson_scripts', None)
+        args.pop('infotext', None)
+
+        script_args = self.init_script_args(img2imgreq, self.default_script_arg_img2img, selectable_scripts, selectable_script_idx, script_runner, input_script_args=infotext_script_args)
+
+        send_images = args.pop('send_images', True)
+        args.pop('save_images', None)
+
+        add_task_to_queue(task_id)
+
+        with self.queue_lock:
+            with closing(StableDiffusionProcessingImg2Img(sd_model=shared.sd_model, **args)) as p:
+                p.init_images = [decode_base64_to_image(x) for x in init_images]
+                p.is_api = True
+                p.scripts = script_runner
+                p.outpath_grids = opts.outdir_img2img_grids
+                p.outpath_samples = opts.outdir_img2img_samples
+
+                try:
+                    shared.state.begin(job="scripts_img2img")
+                    start_task(task_id)
+                    data = {
+                        "image": init_images[0],
+                        "prompt": p.prompt,
+                        "negative_prompt": p.negative_prompt,
+                        "num_images_per_prompt": p.batch_size,
+                        "num_inference_steps": p.steps,
+                        "guidance_scale": p.cfg_scale,
+                        "seed": p.seed,
+                        "height": p.height,
+                        "width": p.width,
+                        "strength": p.denoising_strength}
+
+                    images = url_requests(shared.cmd_opts.opea_img2img_url, data, return_base64str=True)
+
+                    finish_task(task_id)
+                finally:
+                    shared.state.end()
+                    shared.total_tqdm.clear()
+
+        b64images = images if send_images else []
+
+        if not img2imgreq.include_init_images:
+            img2imgreq.init_images = None
+            img2imgreq.mask = None
+
+        return models.ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info="")
 
     def img2imgapi(self, img2imgreq: models.StableDiffusionImg2ImgProcessingAPI):
         task_id = img2imgreq.force_task_id or create_task_id("img2img")

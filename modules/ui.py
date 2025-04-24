@@ -10,7 +10,7 @@ import gradio as gr
 import gradio.utils
 import numpy as np
 from PIL import Image, PngImagePlugin  # noqa: F401
-from modules.call_queue import wrap_gradio_gpu_call, wrap_queued_call, wrap_gradio_call, wrap_gradio_call_no_job # noqa: F401
+from modules.call_queue import wrap_gradio_gpu_call, wrap_queued_call, wrap_gradio_call, wrap_gradio_call_no_job, wrap_gradio_hpu_call # noqa: F401
 
 from modules import gradio_extensons, sd_schedulers  # noqa: F401
 from modules import sd_hijack, sd_models, script_callbacks, ui_extensions, deepbooru, extra_networks, ui_common, ui_postprocessing, progress, ui_loadsave, shared_items, ui_settings, timer, sysinfo, ui_checkpoint_merger, scripts, sd_samplers, processing, ui_extra_networks, ui_toprow, launch_utils
@@ -253,6 +253,7 @@ def create_override_settings_dropdown(tabname, row):
 def create_ui():
     import modules.img2img
     import modules.txt2img
+    import modules.opea_services
 
     reload_javascript()
 
@@ -410,8 +411,14 @@ def create_ui():
                 output_panel.html_log,
             ]
 
+            fn_call = wrap_gradio_gpu_call
+            fn_run = modules.txt2img.txt2img
+            if shared.cmd_opts.opea:
+                fn_call = wrap_gradio_hpu_call
+                fn_run = modules.opea_services.txt2img
+
             txt2img_args = dict(
-                fn=wrap_gradio_gpu_call(modules.txt2img.txt2img, extra_outputs=[None, '', '']),
+                fn=fn_call(fn_run, extra_outputs=[None, '', '']),
                 _js="submit",
                 inputs=txt2img_inputs,
                 outputs=txt2img_outputs,
@@ -729,8 +736,11 @@ def create_ui():
 
             output_panel = create_output_panel("img2img", opts.outdir_img2img_samples, toprow)
 
+            if shared.cmd_opts.opea:
+                fn_run = modules.opea_services.img2img
+
             img2img_args = dict(
-                fn=wrap_gradio_gpu_call(modules.img2img.img2img, extra_outputs=[None, '', '']),
+                fn=fn_call(fn_run, extra_outputs=[None, '', '']),
                 _js="submit_img2img",
                 inputs=[
                     dummy_component,

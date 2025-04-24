@@ -132,3 +132,32 @@ def wrap_gradio_call_no_job(func, extra_outputs=None, add_stats=False):
 
     return f
 
+
+def wrap_gradio_hpu_call(func, extra_outputs=None):
+
+    @wraps(func)
+    def f(*args, **kwargs):
+
+        # if the first argument is a string that says "task(...)", it is treated as a job id
+        if args and type(args[0]) == str and args[0].startswith("task(") and args[0].endswith(")"):
+            id_task = args[0]
+            progress.add_task_to_queue(id_task)
+        else:
+            id_task = None
+
+        with queue_lock:
+            shared.state.begin(job=id_task)
+            progress.start_task(id_task)
+
+            try:
+                res = func(*args, **kwargs)
+                progress.record_results(id_task, res)
+            finally:
+                progress.finish_task(id_task)
+
+            shared.state.end()
+
+        return res
+
+    return wrap_gradio_call(f, extra_outputs=extra_outputs, add_stats=True)
+
